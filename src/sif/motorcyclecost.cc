@@ -27,6 +27,8 @@ namespace {
 constexpr float kDefaultUseHighways = 0.5f; // Factor between 0 and 1
 constexpr float kDefaultUseTolls = 0.5f;    // Factor between 0 and 1
 constexpr float kDefaultUseTrails = 0.0f;   // Factor between 0 and 1
+constexpr float kDefaultUseHills = 0.0f;    // Factor between 0 and 1
+constexpr float kDefaultUsePrimary = 0.0f;  // Factor between 0 and 1
 
 constexpr Surface kMinimumMotorcycleSurface = Surface::kImpassable;
 
@@ -54,6 +56,9 @@ constexpr float kLeftSideTurnCosts[] = {kTCStraight,         kTCSlight,  kTCUnfa
 constexpr ranged_default_t<float> kUseHighwaysRange{0, kDefaultUseHighways, 1.0f};
 constexpr ranged_default_t<float> kUseTollsRange{0, kDefaultUseTolls, 1.0f};
 constexpr ranged_default_t<float> kUseTrailsRange{0, kDefaultUseTrails, 1.0f};
+constexpr ranged_default_t<float> kCurvinessRange{0.0f, 0.0f, 10.0f};
+constexpr ranged_default_t<float> kUseHillsRange{0.0f, kDefaultUseHills, 10.0f};
+constexpr ranged_default_t<float> kUsePrimaryRange{0.0f, kDefaultUsePrimary, 10.0f};
 constexpr ranged_default_t<uint32_t> kMotorcycleSpeedRange{10, baldr::kMaxAssumedSpeed,
                                                            baldr::kMaxSpeedKph};
 
@@ -66,6 +71,37 @@ constexpr float kHighwayFactor[] = {
     0.0f, // Unclassified
     0.0f, // Residential
     0.0f  // Service, other
+};
+
+constexpr float kCurvyRoadClassFactor[] = {
+    10.0f, // Motorway - Huge penalty
+    8.0f,  // Trunk - Huge penalty
+    5.0f,  // Primary - Big penalty
+    0.5f,  // Secondary - Slight penalty
+    0.0f,  // Tertiary - Ideal
+    0.0f,  // Unclassified - Ideal
+    0.2f,  // Residential - Slight penalty
+    1.0f   // Service, other
+};
+
+// Penalty for flat roads, rewards hills. The higher the grade, the lower the penalty.
+constexpr float kFlatPenaltyStrength[] = {
+    0.0f,  // -10%  - Very steep downhill
+    0.0f,  // -8%
+    0.0f,  // -6.5%
+    0.1f,  // -5%   
+    0.2f,  // -3%
+    0.4f,  // -1.5%
+    0.6f,  // 0%    - Flat
+    0.4f,  // 1.5%
+    0.2f,  // 3%
+    0.1f,  // 5%
+    0.0f,  // 6.5%
+    0.0f,  // 8%    
+    0.0f,  // 10%
+    0.0f,  // 11.5%
+    0.0f,  // 13%
+    0.0f   // 15%   - Very steep uphill
 };
 
 constexpr float kMaxTrailBiasFactor = 8.0f;
@@ -291,6 +327,9 @@ public:
   float toll_factor_;    // Factor applied when road has a toll
   float surface_factor_; // How much the surface factors are applied when using trails
   float highway_factor_; // Factor applied when road is a motorway or trunk
+  float curviness_;      // Curviness preference (0.0 to 1.0)
+  float use_hills_;      // Hilliness preference (0.0 to 1.0)
+  float use_primary_;    // Primary road class weight preference (0.0 to 1.0)
 };
 
 // Constructor
@@ -343,6 +382,11 @@ MotorcycleCost::MotorcycleCost(const Costing& costing)
     float f = 1.0f - use_trails * 2.0f;
     surface_factor_ = static_cast<uint32_t>(kMaxTrailBiasFactor * (f * f));
   }
+
+  // Set curviness preference
+  curviness_ = costing_options.curviness();
+  use_hills_ = costing_options.use_hills();
+  use_primary_ = costing_options.use_primary();
 }
 
 // Destructor
@@ -425,8 +469,28 @@ Cost MotorcycleCost::EdgeCost(const baldr::DirectedEdge* edge,
   }
 
   float factor = kDensityFactor[edge->density()] +
-                 highway_factor_ * kHighwayFactor[static_cast<uint32_t>(edge->classification())] +
                  surface_factor_ * kSurfaceFactor[static_cast<uint32_t>(edge->surface())];
+
+  // 1. Curviness / Curve penalty
+  if (curviness_ > 0.0f) {
+    float straightness = 15.0f - edge->curvature();
+    if (straightness > 0.0f) {
+      factor += (straightness * straightness) * curviness_ * 0.015f;
+    }
+  }
+
+  // 2. Hilliness / Flat penalty
+  if (use_hills_ > 0.0f) {
+    factor += use_hills_ * kFlatPenaltyStrength[static_cast<uint32_t>(edge->weighted_grade())];
+  }
+
+  // 3. Road Classification Weights
+  if (use_primary_ > 0.0f) {
+    factor += use_primary_ * kCurvyRoadClassFactor[static_cast<uint32_t>(edge->classification())];
+  } else {
+    factor += highway_factor_ * kHighwayFactor[static_cast<uint32_t>(edge->classification())];
+  }
+
   factor += SpeedPenalty(edge, tile, time_info, flow_sources, edge_speed);
   if (edge->toll()) {
     factor += toll_factor_;
@@ -601,6 +665,9 @@ void ParseMotorcycleCostOptions(const rapidjson::Document& doc,
   JSON_PBF_RANGED_DEFAULT(co, kUseTollsRange, json, "/use_tolls", use_tolls, warnings);
   JSON_PBF_RANGED_DEFAULT(co, kUseTrailsRange, json, "/use_trails", use_trails, warnings);
   JSON_PBF_RANGED_DEFAULT(co, kMotorcycleSpeedRange, json, "/top_speed", top_speed, warnings);
+  JSON_PBF_RANGED_DEFAULT(co, kCurvinessRange, json, "/curviness", curviness, warnings);
+  JSON_PBF_RANGED_DEFAULT(co, kUseHillsRange, json, "/use_hills", use_hills, warnings);
+  JSON_PBF_RANGED_DEFAULT(co, kUsePrimaryRange, json, "/use_primary", use_primary, warnings);
 }
 
 cost_ptr_t CreateMotorcycleCost(const Costing& costing_options) {
