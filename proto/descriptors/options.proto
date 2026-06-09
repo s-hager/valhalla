@@ -361,6 +361,18 @@ message Costing {
     oneof has_curviness {
       float curviness = 97;
     }
+    oneof has_avoid_urban {
+      float avoid_urban = 98;
+    }
+    oneof has_surface_quality {
+      float surface_quality = 99;
+    }
+    oneof has_cornering_time {
+      float cornering_time = 100;
+    }
+    oneof has_flow_preservation {
+      float flow_preservation = 101;
+    }
   }
 
   oneof has_options {

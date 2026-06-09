@@ -59,6 +59,10 @@ constexpr ranged_default_t<float> kUseTrailsRange{0, kDefaultUseTrails, 1.0f};
 constexpr ranged_default_t<float> kCurvinessRange{0.0f, 0.0f, 10.0f};
 constexpr ranged_default_t<float> kUseHillsRange{0.0f, kDefaultUseHills, 10.0f};
 constexpr ranged_default_t<float> kUsePrimaryRange{0.0f, kDefaultUsePrimary, 10.0f};
+constexpr ranged_default_t<float> kAvoidUrbanRange{0.0f, 0.0f, 10.0f};
+constexpr ranged_default_t<float> kSurfaceQualityRange{0.0f, 0.0f, 10.0f};
+constexpr ranged_default_t<float> kCorneringTimeRange{0.0f, 0.0f, 10.0f};
+constexpr ranged_default_t<float> kFlowPreservationRange{0.0f, 0.0f, 10.0f};
 constexpr ranged_default_t<uint32_t> kMotorcycleSpeedRange{10, baldr::kMaxAssumedSpeed,
                                                            baldr::kMaxSpeedKph};
 
@@ -330,6 +334,10 @@ public:
   float curviness_;      // Curviness preference (0.0 to 1.0)
   float use_hills_;      // Hilliness preference (0.0 to 1.0)
   float use_primary_;    // Primary road class weight preference (0.0 to 1.0)
+  float avoid_urban_;
+  float surface_quality_;
+  float cornering_time_;
+  float flow_preservation_;
 };
 
 // Constructor
@@ -387,6 +395,10 @@ MotorcycleCost::MotorcycleCost(const Costing& costing)
   curviness_ = costing_options.curviness();
   use_hills_ = costing_options.use_hills();
   use_primary_ = costing_options.use_primary();
+  avoid_urban_ = costing_options.avoid_urban();
+  surface_quality_ = costing_options.surface_quality();
+  cornering_time_ = costing_options.cornering_time();
+  flow_preservation_ = costing_options.flow_preservation();
 }
 
 // Destructor
@@ -491,6 +503,28 @@ Cost MotorcycleCost::EdgeCost(const baldr::DirectedEdge* edge,
     factor += highway_factor_ * kHighwayFactor[static_cast<uint32_t>(edge->classification())];
   }
 
+  // 4. Urban Flow Penalty
+  if (avoid_urban_ > 0.0f) {
+    if (edge->use() == Use::kResidential || edge->use() == Use::kLivingStreet) {
+      factor += avoid_urban_ * 2.0f;
+    }
+    factor += avoid_urban_ * kDensityFactor[edge->density()];
+  }
+
+  // 5. Surface Condition Penalty
+  if (surface_quality_ > 0.0f && edge->surface() > Surface::kPaved) {
+    factor += surface_quality_ * kSurfaceFactor[static_cast<uint32_t>(edge->surface())] * 5.0f;
+  }
+
+  // 6. Cornering Time Reward
+  if (cornering_time_ > 0.0f) {
+    float curve_val = edge->curvature(); 
+    if (curve_val > 0.0f && edge_speed > 0.0f) {
+      float time_in_curve = (edge->length() / edge_speed) * (curve_val / 15.0f);
+      factor -= cornering_time_ * time_in_curve * 0.05f; 
+    }
+  }
+
   factor += SpeedPenalty(edge, tile, time_info, flow_sources, edge_speed);
   if (edge->toll()) {
     factor += toll_factor_;
@@ -570,6 +604,10 @@ Cost MotorcycleCost::TransitionCost(
         seconds *= stopimpact;
       seconds *= kTransDensityFactor[node->density()];
     }
+
+    if (flow_preservation_ > 0.0f && is_turn) {
+      seconds += flow_preservation_ * 5.0f; 
+    }
     c.cost += seconds;
   }
   return c;
@@ -644,6 +682,10 @@ Cost MotorcycleCost::TransitionCostReverse(
         seconds *= stopimpact;
       seconds *= kTransDensityFactor[node->density()];
     }
+
+    if (flow_preservation_ > 0.0f && is_turn) {
+      seconds += flow_preservation_ * 5.0f; 
+    }
     c.cost += seconds;
   }
   return c;
@@ -668,6 +710,10 @@ void ParseMotorcycleCostOptions(const rapidjson::Document& doc,
   JSON_PBF_RANGED_DEFAULT(co, kCurvinessRange, json, "/curviness", curviness, warnings);
   JSON_PBF_RANGED_DEFAULT(co, kUseHillsRange, json, "/use_hills", use_hills, warnings);
   JSON_PBF_RANGED_DEFAULT(co, kUsePrimaryRange, json, "/use_primary", use_primary, warnings);
+  JSON_PBF_RANGED_DEFAULT(co, kAvoidUrbanRange, json, "/avoid_urban", avoid_urban, warnings);
+  JSON_PBF_RANGED_DEFAULT(co, kSurfaceQualityRange, json, "/surface_quality", surface_quality, warnings);
+  JSON_PBF_RANGED_DEFAULT(co, kCorneringTimeRange, json, "/cornering_time", cornering_time, warnings);
+  JSON_PBF_RANGED_DEFAULT(co, kFlowPreservationRange, json, "/flow_preservation", flow_preservation, warnings);
 }
 
 cost_ptr_t CreateMotorcycleCost(const Costing& costing_options) {
