@@ -63,6 +63,8 @@ constexpr ranged_default_t<float> kAvoidUrbanRange{0.0f, 0.0f, 10.0f};
 constexpr ranged_default_t<float> kSurfaceQualityRange{0.0f, 0.0f, 10.0f};
 constexpr ranged_default_t<float> kCorneringTimeRange{0.0f, 0.0f, 10.0f};
 constexpr ranged_default_t<float> kFlowPreservationRange{0.0f, 0.0f, 10.0f};
+constexpr ranged_default_t<float> kLowSpeedPenaltyRange{0.0f, 0.0f, 10.0f};
+constexpr ranged_default_t<float> kScenicRoutingRange{0.0f, 0.0f, 20.0f};
 constexpr ranged_default_t<uint32_t> kMotorcycleSpeedRange{10, baldr::kMaxAssumedSpeed,
                                                            baldr::kMaxSpeedKph};
 
@@ -338,6 +340,8 @@ public:
   float surface_quality_;
   float cornering_time_;
   float flow_preservation_;
+  float low_speed_penalty_;
+  float scenic_routing_;
 };
 
 // Constructor
@@ -399,6 +403,8 @@ MotorcycleCost::MotorcycleCost(const Costing& costing)
   surface_quality_ = costing_options.surface_quality();
   cornering_time_ = costing_options.cornering_time();
   flow_preservation_ = costing_options.flow_preservation();
+  low_speed_penalty_ = costing_options.low_speed_penalty();
+  scenic_routing_ = costing_options.scenic_routing();
 }
 
 // Destructor
@@ -483,11 +489,29 @@ Cost MotorcycleCost::EdgeCost(const baldr::DirectedEdge* edge,
   float factor = kDensityFactor[edge->density()] +
                  surface_factor_ * kSurfaceFactor[static_cast<uint32_t>(edge->surface())];
 
-  // 1. Curviness / Curve penalty
+  // --- BASE INFLATION HACK ---
+  // Artificially inflate the entire road network so we can apply massive rewards
+  // without mathematically dropping the factor below 1.0 (which breaks A*).
+  float base_inflation = 0.0f;
+  if (curviness_ > 0.0f) {
+      base_inflation += curviness_ * 10.0f;
+  }
+  if (scenic_routing_ > 0.0f) {
+      base_inflation += scenic_routing_ * 5.0f;
+  }
+  factor += base_inflation;
+  // ---------------------------
+
+  // 1. Curviness / Curve penalty AND Reward
   if (curviness_ > 0.0f) {
     float straightness = 15.0f - edge->curvature();
     if (straightness > 0.0f) {
       factor += (straightness * straightness) * curviness_ * 0.015f;
+    }
+    // Reward curvature by subtracting from the inflated factor
+    float curve_amount = edge->curvature();
+    if (curve_amount > 0.0f) {
+      factor -= (curve_amount * curve_amount) * curviness_ * 0.05f;
     }
   }
 
@@ -511,6 +535,29 @@ Cost MotorcycleCost::EdgeCost(const baldr::DirectedEdge* edge,
     factor += avoid_urban_ * kDensityFactor[edge->density()];
   }
 
+  // 4.5. Scenic Routing (Calimoto-like) penalties and rewards
+  if (scenic_routing_ > 0.0f) {
+    // Heavily penalize arterial roads to force routing onto tertiary/unclassified
+    auto cls = edge->classification();
+    if (cls == RoadClass::kMotorway) factor += scenic_routing_ * 10.0f;
+    else if (cls == RoadClass::kTrunk) factor += scenic_routing_ * 10.0f;
+    else if (cls == RoadClass::kPrimary) factor += scenic_routing_ * 5.0f;
+    else if (cls == RoadClass::kSecondary) factor += scenic_routing_ * 2.0f;
+    
+    // Penalize straightness ONLY for non-residential roads
+    if (cls != RoadClass::kResidential && cls != RoadClass::kServiceOther) {
+       float straightness = 15.0f - edge->curvature();
+       if (straightness > 0.0f) {
+          factor += (straightness * straightness) * scenic_routing_ * 0.005f;
+       }
+    }
+    
+    // Reward bike networks (scenic country roads) by subtracting from inflation
+    if (edge->bike_network()) {
+        factor -= scenic_routing_ * 2.0f;
+    }
+  }
+
   // 5. Surface Condition Penalty
   if (surface_quality_ > 0.0f && edge->surface() > Surface::kPaved) {
     factor += surface_quality_ * kSurfaceFactor[static_cast<uint32_t>(edge->surface())] * 5.0f;
@@ -521,9 +568,21 @@ Cost MotorcycleCost::EdgeCost(const baldr::DirectedEdge* edge,
     float curve_val = edge->curvature(); 
     if (curve_val > 0.0f && edge_speed > 0.0f) {
       float time_in_curve = (edge->length() / edge_speed) * (curve_val / 15.0f);
-      factor -= cornering_time_ * time_in_curve * 0.05f; 
+      float reward = cornering_time_ * time_in_curve * 0.05f;
+      // Do NOT clamp here! Allow it to eat into the base inflation.
+      factor -= reward; 
     }
   }
+
+  // 7. Low Speed Penalty
+  if (low_speed_penalty_ > 0.0f && edge_speed < 40.0f) {
+    // Increase the penalty the slower the road is below 40.
+    factor += low_speed_penalty_ * (40.0f - edge_speed) * 0.1f;
+  }
+
+  // FINAL CLAMP TO PREVENT A* SEARCH FAILURE
+  // Ensure the factor never drops below 1.0, preserving the A* heuristic's validity
+  factor = std::max(1.0f, factor);
 
   factor += SpeedPenalty(edge, tile, time_info, flow_sources, edge_speed);
   if (edge->toll()) {
@@ -714,6 +773,8 @@ void ParseMotorcycleCostOptions(const rapidjson::Document& doc,
   JSON_PBF_RANGED_DEFAULT(co, kSurfaceQualityRange, json, "/surface_quality", surface_quality, warnings);
   JSON_PBF_RANGED_DEFAULT(co, kCorneringTimeRange, json, "/cornering_time", cornering_time, warnings);
   JSON_PBF_RANGED_DEFAULT(co, kFlowPreservationRange, json, "/flow_preservation", flow_preservation, warnings);
+  JSON_PBF_RANGED_DEFAULT(co, kLowSpeedPenaltyRange, json, "/low_speed_penalty", low_speed_penalty, warnings);
+  JSON_PBF_RANGED_DEFAULT(co, kScenicRoutingRange, json, "/scenic_routing", scenic_routing, warnings);
 }
 
 cost_ptr_t CreateMotorcycleCost(const Costing& costing_options) {

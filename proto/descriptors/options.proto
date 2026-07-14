@@ -373,6 +373,12 @@ message Costing {
     oneof has_flow_preservation {
       float flow_preservation = 101;
     }
+    oneof has_low_speed_penalty {
+      float low_speed_penalty = 102;
+    }
+    oneof has_scenic_routing {
+      float scenic_routing = 103;
+    }
   }
 
   oneof has_options {
